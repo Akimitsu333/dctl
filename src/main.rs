@@ -219,18 +219,18 @@ fn main() {
             let _ = std::fs::remove_file(SOCKET_PATH);
             let listener = UnixListener::bind(SOCKET_PATH).expect("[socket] bad bind(path)");
 
-            let queue = Arc::new(ServiceStack::new(CONFIG_PATH));
+            let stack = Arc::new(ServiceStack::new(CONFIG_PATH));
 
             info!("[daemon] daemon start runining");
 
-            queue.start();
+            stack.start();
 
             info!("[service] services start running");
 
             for stream in listener.incoming() {
-                let mut stream = stream.expect("[socket] bad unwrap unix stream");
+                let mut stream = stream.expect("[socket] bad accept socket");
 
-                let queue = Arc::clone(&queue);
+                let stack = Arc::clone(&stack);
 
                 thread::spawn(move || {
                     let mut message = String::new();
@@ -241,9 +241,9 @@ fn main() {
 
                     match (message[0], message[1]) {
                         ("daemon", "stop") => {
-                            queue.stop();
+                            stack.stop();
                             stream
-                                .write_all(queue.to_string().as_bytes())
+                                .write_all(stack.to_string().as_bytes())
                                 .expect("[message] bad send");
 
                             info!("[daemon] daemon is ready to exit");
@@ -252,11 +252,11 @@ fn main() {
                         }
                         ("daemon", "status") => {
                             stream
-                                .write_all(queue.to_string().as_bytes())
+                                .write_all(stack.to_string().as_bytes())
                                 .expect("[message] bad send");
                         }
                         ("status", s_name) => {
-                            let service = queue.get(s_name).unwrap();
+                            let service = stack.get(s_name).unwrap();
                             stream
                                 .write_all(service.to_string().as_bytes())
                                 .expect("[message] bad send");
@@ -264,7 +264,7 @@ fn main() {
                         ("restart", s_name) => {
                             info!("[service] [restart] {s_name}");
 
-                            let service = queue.get(s_name).unwrap();
+                            let service = stack.get(s_name).unwrap();
                             service.restart();
                             stream
                                 .write_all(format!("{service} {s_name}").as_bytes())
@@ -273,7 +273,7 @@ fn main() {
                         ("start", s_name) => {
                             info!("[service] [start] {s_name}");
 
-                            let service = queue.get(s_name).unwrap();
+                            let service = stack.get(s_name).unwrap();
                             service.start();
                             stream
                                 .write_all(format!("{service} {s_name}").as_bytes())
@@ -282,7 +282,7 @@ fn main() {
                         ("stop", s_name) => {
                             info!("[service] [stop] {s_name}");
 
-                            let service = queue.get(s_name).unwrap();
+                            let service = stack.get(s_name).unwrap();
                             service.stop();
                             stream
                                 .write_all(format!("{service} {s_name}").as_bytes())
