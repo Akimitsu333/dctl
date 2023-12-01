@@ -1,9 +1,8 @@
-use libc::kill_;
-use log::{error, info, LevelFilter, Metadata, Record};
-use settings::*;
+use log::{error, info, LevelFilter};
 use std::collections::HashMap;
 use std::fmt::{self, Display};
-use std::io::prelude::*;
+use std::fs::File;
+use std::io::{prelude::*, BufReader, Lines};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -11,240 +10,168 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const RESTART_SEC: u64 = 1;
+mod config;
+mod libc;
+mod logger;
 
-#[cfg(target_os = "linux")]
-mod settings {
-    pub const SOCKET_PATH: &str = "/tmp/daemon.sock";
-    pub const CONFIG_PATH: &str = "/tmp/config";
-    pub const LOG_PATH: &str = "/tmp/daemon.log";
-}
+use config::*;
+use libc::kill_;
+use logger::SimpleLogger;
 
-#[cfg(target_os = "android")]
-mod settings {
-    pub const SOCKET_PATH: &str = "/data/daemon/daemon.sock";
-    pub const CONFIG_PATH: &str = "/data/daemon/config";
-    pub const LOG_PATH: &str = "/data/daemon/daemon.log";
-}
+struct ConfigReader(Lines<BufReader<File>>);
 
-mod libc {
-    extern "C" {
-        fn kill(pid: u32, sig: u32) -> i32;
-    }
-
-    pub fn kill_(pid: u32, sig: u32) -> i32 {
-        unsafe { kill(pid, sig) }
+impl ConfigReader {
+    fn new(config_path: &str) -> Self {
+        Self(BufReader::new(File::open(config_path).expect("bad open file")).lines())
     }
 }
 
-struct SimpleLogger {
-    level: LevelFilter,
-    writable: Mutex<std::fs::File>,
-}
+impl Iterator for ConfigReader {
+    type Item = (String, String, Vec<String>);
 
-impl SimpleLogger {
-    fn init(level: LevelFilter, path: &str) -> Result<(), log::SetLoggerError> {
-        log::set_max_level(level);
-        log::set_boxed_logger(SimpleLogger::new(
-            level,
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .expect("[log] bad open file"),
-        ))
-    }
+    fn next(&mut self) -> Option<Self::Item> {
+        for line in &mut self.0 {
+            let line = line.expect("[load] bad read line(of config file)");
+            let parts: Vec<&str> = line.splitn(3, ' ').collect();
+            let mut args = Vec::new();
+            match parts.len() {
+                0 | 1 => continue,
+                2 => (),
+                _ => {
+                    args.extend(
+                        parts[2]
+                            .split_whitespace()
+                            .map(|arg| arg.to_string())
+                            .collect::<Vec<String>>(),
+                    );
+                }
+            };
 
-    fn new(level: LevelFilter, writable: std::fs::File) -> Box<SimpleLogger> {
-        Box::new(SimpleLogger {
-            level,
-            writable: Mutex::new(writable),
-        })
-    }
-}
-
-impl log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            let mut writable = self.writable.lock().unwrap();
-            let _ = writable.write_all(
-                format!(
-                    "[{}] {}\n",
-                    record.level().as_str().to_lowercase(),
-                    record.args()
-                )
-                .as_bytes(),
-            );
+            return Some((parts[0].to_string(), parts[1].to_string(), args));
         }
-    }
 
-    fn flush(&self) {
-        let _ = self.writable.lock().unwrap().flush();
+        None
     }
 }
 
-struct ServiceQueue {
-    queue: HashMap<String, Service>,
-}
+struct ServiceStack(HashMap<String, ArcService>);
 
-impl std::ops::Deref for ServiceQueue {
-    type Target = HashMap<String, Service>;
+impl std::ops::Deref for ServiceStack {
+    type Target = HashMap<String, ArcService>;
 
     fn deref(&self) -> &Self::Target {
-        &self.queue
+        &self.0
     }
 }
 
-impl std::ops::DerefMut for ServiceQueue {
+impl std::ops::DerefMut for ServiceStack {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.queue
+        &mut self.0
     }
 }
 
-impl Display for ServiceQueue {
+impl Display for ServiceStack {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut status_queue: Vec<String> = Vec::new();
-        for (k, v) in &self.queue {
+        for (k, v) in &self.0 {
             status_queue.push(format!("{} {}", v, k));
         }
         write!(f, "{}", status_queue.join("\n"))
     }
 }
 
-impl ServiceQueue {
+impl ServiceStack {
     fn new(config_path: &str) -> Self {
         let mut queue = HashMap::new();
+        let config = ConfigReader::new(config_path);
 
         info!("[load] start loading the service");
 
-        for line in
-            std::io::BufReader::new(std::fs::File::open(config_path).expect("bad open file"))
-                .lines()
-        {
-            let line = line.expect("[load] bad read line(of config file)");
-
-            let mut parts: Vec<&str> = Vec::new();
-            let mut args: Vec<String> = Vec::new();
-
-            match line.chars().filter(|&c| c == ' ').count() {
-                0 => continue,
-                1 => {
-                    parts.extend(line.splitn(2, ' ').collect::<Vec<&str>>());
-                }
-                _ => {
-                    parts.extend(line.splitn(3, ' ').collect::<Vec<&str>>());
-                    args.extend(
-                        parts[2]
-                            .split_whitespace()
-                            .map(|s| s.to_string())
-                            .collect::<Vec<String>>(),
-                    );
-                }
-            }
-
-            info!("[load] {1} {2} ({0})", parts[0], parts[1], args.join(" "));
-
-            queue.insert(
-                parts[0].to_string(),
-                Service::new(parts[1].to_string(), args),
-            );
+        for (name, command, args) in config {
+            info!("[load] {} {} ({})", &command, args.join(" "), &name);
+            queue.insert(name, ArcService::new(command, args));
         }
 
-        Self { queue }
+        Self(queue)
     }
 
     fn start(&self) {
-        for v in self.queue.values() {
+        for v in self.0.values() {
             v.start();
         }
     }
 
     fn stop(&self) {
-        for v in self.queue.values() {
+        for v in self.0.values() {
             v.stop();
         }
     }
 }
 
-struct ServiceStatus {
+struct ArcService(Arc<Service>);
+struct Service {
+    command: String,
+    args: Vec<String>,
     flag: AtomicBool,
     pid: AtomicU32,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl ServiceStatus {
-    fn new() -> Self {
+impl Service {
+    fn new(command: String, args: Vec<String>) -> Self {
         Self {
+            command,
+            args,
             flag: AtomicBool::new(true),
             pid: AtomicU32::new(0),
             thread: Mutex::new(None),
         }
     }
-
-    fn get(&self) -> (String, String) {
-        (
-            self.flag.load(Ordering::Relaxed).to_string(),
-            self.pid.load(Ordering::Relaxed).to_string(),
-        )
-    }
 }
 
-struct Service {
-    command: Arc<(String, Vec<String>)>,
-    status: Arc<ServiceStatus>,
-}
-
-impl Display for Service {
+impl Display for ArcService {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let status = self.status.get();
-        write!(f, "[{}] {}", status.0, status.1)
+        let flag = self.0.flag.load(Ordering::Relaxed).to_string();
+        let pid = self.0.pid.load(Ordering::Relaxed).to_string();
+        write!(f, "[{}] {}", flag, pid)
     }
 }
 
-impl Service {
-    fn new(basename: String, args: Vec<String>) -> Self {
-        Self {
-            command: Arc::new((basename, args)),
-            status: Arc::new(ServiceStatus::new()),
-        }
+impl ArcService {
+    fn new(command: String, args: Vec<String>) -> Self {
+        Self(Arc::new(Service::new(command, args)))
     }
 
     fn start(&self) {
-        let mut thread = self.status.thread.lock().unwrap();
-
-        let command = Arc::clone(&self.command);
-        let status = Arc::clone(&self.status);
+        let mut thread = self.0.thread.lock().unwrap();
+        let service = Arc::clone(&self.0);
 
         if thread.is_none() {
-            self.status.flag.store(true, Ordering::Relaxed);
+            self.0.flag.store(true, Ordering::Relaxed);
 
             *thread = Some(thread::spawn(move || loop {
-                let mut command = Command::new(&command.0)
-                    .args(&command.1)
+                let mut command = Command::new(&service.command)
+                    .args(&service.args)
                     .spawn()
                     .expect("[command] bad start(wrong command)");
 
-                status.pid.store(command.id(), Ordering::Release);
+                service.pid.store(command.id(), Ordering::Release);
 
                 let start_time = Instant::now();
 
                 let result = command.wait().unwrap().success();
 
-                status.pid.store(0, Ordering::Release);
+                service.pid.store(0, Ordering::Release);
 
                 let time_result = start_time.elapsed() > Duration::from_secs(RESTART_SEC);
-                let flag = status.flag.load(Ordering::Acquire);
+                let flag = service.flag.load(Ordering::Acquire);
 
                 if !result && flag && time_result {
                     continue;
                 } else {
                     error!("[command] terminate");
-                    *status.thread.lock().unwrap() = None;
-                    status.flag.store(false, Ordering::Release);
+                    *service.thread.lock().unwrap() = None;
+                    service.flag.store(false, Ordering::Release);
                     break;
                 }
             }));
@@ -252,14 +179,14 @@ impl Service {
     }
 
     fn stop(&self) {
-        let thread = self.status.thread.lock().unwrap();
+        let thread = self.0.thread.lock().unwrap();
 
         if thread.is_some() {
-            self.status.flag.store(false, Ordering::Relaxed);
+            self.0.flag.store(false, Ordering::Relaxed);
 
-            kill_(self.status.pid.load(Ordering::Relaxed), 15);
+            kill_(self.0.pid.load(Ordering::Relaxed), 15);
 
-            self.status.pid.store(0, Ordering::Release);
+            self.0.pid.store(0, Ordering::Release);
         }
     }
 
@@ -292,7 +219,7 @@ fn main() {
             let _ = std::fs::remove_file(SOCKET_PATH);
             let listener = UnixListener::bind(SOCKET_PATH).expect("[socket] bad bind(path)");
 
-            let queue = Arc::new(ServiceQueue::new(CONFIG_PATH));
+            let queue = Arc::new(ServiceStack::new(CONFIG_PATH));
 
             info!("[daemon] daemon start runining");
 
