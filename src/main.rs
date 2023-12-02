@@ -114,7 +114,7 @@ struct Service {
     args: Vec<String>,
     flag: AtomicBool,
     pid: AtomicU32,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    guardian: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Service {
@@ -124,7 +124,7 @@ impl Service {
             args,
             flag: AtomicBool::new(true),
             pid: AtomicU32::new(0),
-            thread: Mutex::new(None),
+            guardian: Mutex::new(None),
         }
     }
 }
@@ -143,13 +143,13 @@ impl ArcService {
     }
 
     fn start(&self) {
-        let mut thread = self.0.thread.lock().unwrap();
-        let service = Arc::clone(&self.0);
+        let mut guardian = self.0.guardian.lock().unwrap();
 
-        if thread.is_none() {
+        if guardian.is_none() {
             self.0.flag.store(true, Ordering::Relaxed);
 
-            *thread = Some(thread::spawn(move || loop {
+            let service = Arc::clone(&self.0);
+            *guardian = Some(thread::spawn(move || loop {
                 let mut command = Command::new(&service.command)
                     .args(&service.args)
                     .spawn()
@@ -170,7 +170,7 @@ impl ArcService {
                     continue;
                 } else {
                     error!("[command] terminate");
-                    *service.thread.lock().unwrap() = None;
+                    *service.guardian.lock().unwrap() = None;
                     service.flag.store(false, Ordering::Release);
                     break;
                 }
@@ -179,9 +179,9 @@ impl ArcService {
     }
 
     fn stop(&self) {
-        let thread = self.0.thread.lock().unwrap();
+        let guardian = self.0.guardian.lock().unwrap();
 
-        if thread.is_some() {
+        if guardian.is_some() {
             self.0.flag.store(false, Ordering::Relaxed);
 
             kill_(self.0.pid.load(Ordering::Relaxed), 15);
