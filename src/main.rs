@@ -21,8 +21,8 @@ use logger::SimpleLogger;
 struct ConfigReader(Lines<BufReader<File>>);
 
 impl ConfigReader {
-    fn new(config_path: &str) -> Self {
-        Self(BufReader::new(File::open(config_path).expect("bad open file")).lines())
+    fn new(fpath: &str) -> Self {
+        Self(BufReader::new(File::open(fpath).expect("bad open file")).lines())
     }
 }
 
@@ -47,33 +47,41 @@ impl Iterator for ConfigReader {
                 }
             };
 
-            return Some((parts[0].to_string(), parts[1].to_string(), args));
+            let name = parts[0];
+            let command = parts[1];
+
+            info!("[load] {}: {} {}", name, command, args.join(" "));
+
+            return Some((name.to_string(), command.to_string(), args));
         }
 
         None
     }
 }
 
-struct ServiceStack(HashMap<String, ArcService>);
+struct ServiceStack {
+    stack: HashMap<String, ArcService>,
+    _fpath: String,
+}
 
 impl std::ops::Deref for ServiceStack {
     type Target = HashMap<String, ArcService>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.stack
     }
 }
 
 impl std::ops::DerefMut for ServiceStack {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.stack
     }
 }
 
 impl Display for ServiceStack {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut status_queue: Vec<String> = Vec::new();
-        for (k, v) in &self.0 {
+        for (k, v) in &self.stack {
             status_queue.push(format!("{} {}", v, k));
         }
         write!(f, "{}", status_queue.join("\n"))
@@ -81,28 +89,30 @@ impl Display for ServiceStack {
 }
 
 impl ServiceStack {
-    fn new(config_path: &str) -> Self {
-        let mut queue = HashMap::new();
-        let config = ConfigReader::new(config_path);
-
-        info!("[load] start loading the service");
-
-        for (name, command, args) in config {
-            info!("[load] {} {} ({})", &command, args.join(" "), &name);
-            queue.insert(name, ArcService::new(command, args));
+    fn new(stack: HashMap<String, ArcService>, fpath: String) -> Self {
+        Self {
+            stack,
+            _fpath: fpath,
         }
+    }
 
-        Self(queue)
+    fn init(fpath: &str) -> Self {
+        let config = ConfigReader::new(fpath);
+        let config_hashmap: HashMap<String, ArcService> = config
+            .map(|(name, command, args)| (name, ArcService::new(command, args)))
+            .collect();
+
+        ServiceStack::new(config_hashmap, fpath.to_string())
     }
 
     fn start(&self) {
-        for v in self.0.values() {
+        for v in self.stack.values() {
             v.start();
         }
     }
 
     fn stop(&self) {
-        for v in self.0.values() {
+        for v in self.stack.values() {
             v.stop();
         }
     }
@@ -219,7 +229,7 @@ fn main() {
             let _ = std::fs::remove_file(SOCKET_PATH);
             let listener = UnixListener::bind(SOCKET_PATH).expect("[socket] bad bind(path)");
 
-            let stack = Arc::new(ServiceStack::new(CONFIG_PATH));
+            let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
 
             info!("[daemon] daemon start runining");
 
