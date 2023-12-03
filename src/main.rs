@@ -61,7 +61,7 @@ impl Iterator for ConfigReader {
 
 struct ServiceStack {
     stack: HashMap<String, ArcService>,
-    _fpath: String,
+    // fpath: String,
 }
 
 impl Display for ServiceStack {
@@ -75,53 +75,54 @@ impl Display for ServiceStack {
 }
 
 impl ServiceStack {
-    fn new(stack: HashMap<String, ArcService>, fpath: String) -> Self {
-        Self {
-            stack,
-            _fpath: fpath,
-        }
+    fn new(stack: HashMap<String, ArcService>) -> Self {
+        Self { stack }
     }
 
     fn init(fpath: &str) -> Self {
-        let config = ConfigReader::new(fpath);
-        let config_hashmap: HashMap<String, ArcService> = config
+        let config_hashmap: HashMap<String, ArcService> = ConfigReader::new(fpath)
             .map(|(name, command, args)| (name, ArcService::new(command, args)))
             .collect();
 
-        ServiceStack::new(config_hashmap, fpath.to_string())
+        ServiceStack::new(config_hashmap)
     }
 
     fn start(&self, name: &str) -> String {
-        let service = self.stack.get(name).expect("service: bad read stack");
-        service.start();
-        service.to_string()
+        match self.stack.get(name) {
+            Some(service) => service.start().to_string(),
+            None => String::from("service: can't find {name}"),
+        }
     }
 
     fn stop(&self, name: &str) -> String {
-        let service = self.stack.get(name).expect("service: bad read stack");
-        service.stop();
-        service.to_string()
+        match self.stack.get(name) {
+            Some(service) => service.stop().to_string(),
+            None => String::from("service: can't find {name}"),
+        }
     }
 
     fn restart(&self, name: &str) -> String {
-        let service = self.stack.get(name).expect("service: bad read stack");
-        service.stop().start();
-        service.to_string()
+        match self.stack.get(name) {
+            Some(service) => service.stop().start().to_string(),
+            None => String::from("service: can't find {name}"),
+        }
     }
 
     fn status(&self, name: &str) -> String {
-        self.stack
-            .get(name)
-            .expect("service: bad read stack")
-            .to_string()
+        match self.stack.get(name) {
+            Some(service) => service.to_string(),
+            None => String::from("service: can't find {name}"),
+        }
     }
 
-    fn start_all(&self) {
+    fn start_all(&self) -> String {
         let _: Vec<&ArcService> = self.stack.values().map(|s| s.start()).collect();
+        self.to_string()
     }
 
-    fn stop_all(&self) {
+    fn stop_all(&self) -> String {
         let _: Vec<&ArcService> = self.stack.values().map(|s| s.stop()).collect();
+        self.to_string()
     }
 }
 
@@ -166,11 +167,21 @@ impl ArcService {
             self.0.flag.store(true, Ordering::Relaxed);
 
             let service = Arc::clone(&self.0);
+
             *guardian = Some(thread::spawn(move || loop {
-                let mut command = Command::new(&service.command)
-                    .args(&service.args)
-                    .spawn()
-                    .expect("command: bad start(wrong command)");
+                let mut command = match Command::new(&service.command).args(&service.args).spawn() {
+                    Ok(command) => command,
+                    Err(_) => {
+                        error!(
+                            "command: bad start: {} {}",
+                            &service.command,
+                            service.args.join(" ")
+                        );
+                        *service.guardian.lock().unwrap() = None;
+                        service.flag.store(false, Ordering::Release);
+                        break;
+                    }
+                };
 
                 service.pid.store(command.id(), Ordering::Release);
 
@@ -186,7 +197,11 @@ impl ArcService {
                 if !result && flag && time_result {
                     continue;
                 } else {
-                    error!("command: terminate");
+                    error!(
+                        "command: terminate: {} {}",
+                        &service.command,
+                        service.args.join(" ")
+                    );
                     *service.guardian.lock().unwrap() = None;
                     service.flag.store(false, Ordering::Release);
                     break;
@@ -222,7 +237,7 @@ fn daemon() {
 
     info!("daemon: daemon start runining");
 
-    stack.start_all();
+    let _ = stack.start_all();
 
     info!("service: services start running");
 
@@ -240,9 +255,8 @@ fn daemon() {
 
             match (message[0], message[1]) {
                 ("daemon", "stop") => {
-                    stack.stop_all();
                     stream
-                        .write_all(stack.to_string().as_bytes())
+                        .write_all(stack.stop_all().as_bytes())
                         .expect("message: bad send");
 
                     info!("daemon: daemon is ready to exit");
