@@ -31,7 +31,7 @@ impl Iterator for ConfigReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         for line in &mut self.0 {
-            let line = line.expect("load: bad read line(of config file)");
+            let line = line.expect("service: bad load service(of config file)");
             let parts: Vec<&str> = line.splitn(3, ' ').collect();
             let mut args = Vec::new();
             match parts.len() {
@@ -50,7 +50,7 @@ impl Iterator for ConfigReader {
             let name = parts[0];
             let command = parts[1];
 
-            info!("load: {}: {} {}", name, command, args.join(" "));
+            info!("service: {}: {} {}", name, command, args.join(" "));
 
             return Some((name.to_string(), command.to_string(), args));
         }
@@ -229,16 +229,18 @@ impl ArcService {
 fn daemon() {
     let _ = SimpleLogger::init(LevelFilter::Info, LOG_PATH);
 
+    info!("daemon: start running");
+
     let _ = std::fs::remove_file(SOCKET_PATH);
     let listener = UnixListener::bind(SOCKET_PATH).expect("socket: bad bind(path)");
 
-    let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
+    info!("service: start loading");
 
-    info!("daemon: daemon start runining");
+    let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
 
     let _ = stack.start_all();
 
-    info!("service: services start running");
+    info!("service: start running");
 
     for stream in listener.incoming() {
         let mut stream = stream.expect("socket: bad accept socket");
