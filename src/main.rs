@@ -31,7 +31,7 @@ impl Iterator for ConfigReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         for line in &mut self.0 {
-            let line = line.expect("[load] bad read line(of config file)");
+            let line = line.expect("load: bad read line(of config file)");
             let parts: Vec<&str> = line.splitn(3, ' ').collect();
             let mut args = Vec::new();
             match parts.len() {
@@ -50,7 +50,7 @@ impl Iterator for ConfigReader {
             let name = parts[0];
             let command = parts[1];
 
-            info!("[load] {}: {} {}", name, command, args.join(" "));
+            info!("load: {}: {} {}", name, command, args.join(" "));
 
             return Some((name.to_string(), command.to_string(), args));
         }
@@ -62,20 +62,6 @@ impl Iterator for ConfigReader {
 struct ServiceStack {
     stack: HashMap<String, ArcService>,
     _fpath: String,
-}
-
-impl std::ops::Deref for ServiceStack {
-    type Target = HashMap<String, ArcService>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.stack
-    }
-}
-
-impl std::ops::DerefMut for ServiceStack {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.stack
-    }
 }
 
 impl Display for ServiceStack {
@@ -105,16 +91,37 @@ impl ServiceStack {
         ServiceStack::new(config_hashmap, fpath.to_string())
     }
 
-    fn start(&self) {
-        for v in self.stack.values() {
-            v.start();
-        }
+    fn start(&self, name: &str) -> String {
+        let service = self.stack.get(name).expect("service: bad read stack");
+        service.start();
+        service.to_string()
     }
 
-    fn stop(&self) {
-        for v in self.stack.values() {
-            v.stop();
-        }
+    fn stop(&self, name: &str) -> String {
+        let service = self.stack.get(name).expect("service: bad read stack");
+        service.stop();
+        service.to_string()
+    }
+
+    fn restart(&self, name: &str) -> String {
+        let service = self.stack.get(name).expect("service: bad read stack");
+        service.stop().start();
+        service.to_string()
+    }
+
+    fn status(&self, name: &str) -> String {
+        self.stack
+            .get(name)
+            .expect("service: bad read stack")
+            .to_string()
+    }
+
+    fn start_all(&self) {
+        let _: Vec<&ArcService> = self.stack.values().map(|s| s.start()).collect();
+    }
+
+    fn stop_all(&self) {
+        let _: Vec<&ArcService> = self.stack.values().map(|s| s.stop()).collect();
     }
 }
 
@@ -152,7 +159,7 @@ impl ArcService {
         Self(Arc::new(Service::new(command, args)))
     }
 
-    fn start(&self) {
+    fn start(&self) -> &Self {
         let mut guardian = self.0.guardian.lock().unwrap();
 
         if guardian.is_none() {
@@ -163,7 +170,7 @@ impl ArcService {
                 let mut command = Command::new(&service.command)
                     .args(&service.args)
                     .spawn()
-                    .expect("[command] bad start(wrong command)");
+                    .expect("command: bad start(wrong command)");
 
                 service.pid.store(command.id(), Ordering::Release);
 
@@ -179,16 +186,18 @@ impl ArcService {
                 if !result && flag && time_result {
                     continue;
                 } else {
-                    error!("[command] terminate");
+                    error!("command: terminate");
                     *service.guardian.lock().unwrap() = None;
                     service.flag.store(false, Ordering::Release);
                     break;
                 }
             }));
         }
+
+        self
     }
 
-    fn stop(&self) {
+    fn stop(&self) -> &Self {
         let guardian = self.0.guardian.lock().unwrap();
 
         if guardian.is_some() {
@@ -198,12 +207,104 @@ impl ArcService {
 
             self.0.pid.store(0, Ordering::Release);
         }
-    }
 
-    fn restart(&self) {
-        self.stop();
-        self.start();
+        self
     }
+}
+
+fn daemon() {
+    let _ = SimpleLogger::init(LevelFilter::Info, LOG_PATH);
+
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    let listener = UnixListener::bind(SOCKET_PATH).expect("socket: bad bind(path)");
+
+    let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
+
+    info!("daemon: daemon start runining");
+
+    stack.start_all();
+
+    info!("service: services start running");
+
+    for stream in listener.incoming() {
+        let mut stream = stream.expect("socket: bad accept socket");
+
+        let stack = Arc::clone(&stack);
+
+        thread::spawn(move || {
+            let mut message = String::new();
+            stream
+                .read_to_string(&mut message)
+                .expect("message: bad read");
+            let message: Vec<&str> = message.split('#').collect();
+
+            match (message[0], message[1]) {
+                ("daemon", "stop") => {
+                    stack.stop_all();
+                    stream
+                        .write_all(stack.to_string().as_bytes())
+                        .expect("message: bad send");
+
+                    info!("daemon: daemon is ready to exit");
+
+                    std::process::exit(0);
+                }
+                ("daemon", "status") => {
+                    stream
+                        .write_all(stack.to_string().as_bytes())
+                        .expect("message: bad send");
+                }
+                ("status", name) => {
+                    stream
+                        .write_all(stack.status(name).as_bytes())
+                        .expect("message: bad send");
+                }
+                ("start", name) => {
+                    info!("service: start: {name}");
+
+                    stream
+                        .write_all(format!("{} {name}", stack.start(name)).as_bytes())
+                        .expect("message: bad send");
+                }
+                ("stop", name) => {
+                    info!("service: stop: {name}");
+
+                    stream
+                        .write_all(format!("{} {name}", stack.stop(name)).as_bytes())
+                        .expect("message: bad send");
+                }
+                ("restart", name) => {
+                    info!("service: restart: {name}");
+
+                    stream
+                        .write_all(format!("{} {name}", stack.restart(name)).as_bytes())
+                        .expect("message: bad send");
+                }
+                _ => {
+                    error!("option: invalid parameter");
+                    stream
+                        .write_all("option: invalid parameter".as_bytes())
+                        .expect("message: bad send");
+                }
+            }
+
+            stream.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+    }
+}
+
+fn client(args: (&str, &str)) {
+    let mut stream = UnixStream::connect(SOCKET_PATH).expect("socket: bad connect(path)");
+    stream
+        .write_all(format!("{}#{}", args.0, args.1).as_bytes())
+        .expect("message: bad send");
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("reponse: bad read");
+    println!("{}", response);
 }
 
 fn main() {
@@ -217,111 +318,13 @@ fn main() {
         2 => ("daemon", args[1].as_str()),
         3 => (args[1].as_str(), args[2].as_str()),
         _ => {
-            eprintln!("[option] bad command format");
+            eprintln!("option: bad command format");
             std::process::exit(-1);
         }
     };
 
     match normalized_args {
-        ("daemon", "start") => {
-            let _ = SimpleLogger::init(LevelFilter::Info, LOG_PATH);
-
-            let _ = std::fs::remove_file(SOCKET_PATH);
-            let listener = UnixListener::bind(SOCKET_PATH).expect("[socket] bad bind(path)");
-
-            let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
-
-            info!("[daemon] daemon start runining");
-
-            stack.start();
-
-            info!("[service] services start running");
-
-            for stream in listener.incoming() {
-                let mut stream = stream.expect("[socket] bad accept socket");
-
-                let stack = Arc::clone(&stack);
-
-                thread::spawn(move || {
-                    let mut message = String::new();
-                    stream
-                        .read_to_string(&mut message)
-                        .expect("[message] bad read");
-                    let message: Vec<&str> = message.split('#').collect();
-
-                    match (message[0], message[1]) {
-                        ("daemon", "stop") => {
-                            stack.stop();
-                            stream
-                                .write_all(stack.to_string().as_bytes())
-                                .expect("[message] bad send");
-
-                            info!("[daemon] daemon is ready to exit");
-
-                            std::process::exit(0);
-                        }
-                        ("daemon", "status") => {
-                            stream
-                                .write_all(stack.to_string().as_bytes())
-                                .expect("[message] bad send");
-                        }
-                        ("status", s_name) => {
-                            let service = stack.get(s_name).unwrap();
-                            stream
-                                .write_all(service.to_string().as_bytes())
-                                .expect("[message] bad send");
-                        }
-                        ("restart", s_name) => {
-                            info!("[service] [restart] {s_name}");
-
-                            let service = stack.get(s_name).unwrap();
-                            service.restart();
-                            stream
-                                .write_all(format!("{service} {s_name}").as_bytes())
-                                .expect("[message] bad send");
-                        }
-                        ("start", s_name) => {
-                            info!("[service] [start] {s_name}");
-
-                            let service = stack.get(s_name).unwrap();
-                            service.start();
-                            stream
-                                .write_all(format!("{service} {s_name}").as_bytes())
-                                .expect("[message] bad send");
-                        }
-                        ("stop", s_name) => {
-                            info!("[service] [stop] {s_name}");
-
-                            let service = stack.get(s_name).unwrap();
-                            service.stop();
-                            stream
-                                .write_all(format!("{service} {s_name}").as_bytes())
-                                .expect("[message] bad send");
-                        }
-                        _ => {
-                            error!("[option] invalid parameter");
-                            stream
-                                .write_all("[option] invalid parameter".as_bytes())
-                                .expect("[message] bad send");
-                        }
-                    }
-
-                    stream.shutdown(std::net::Shutdown::Both).unwrap();
-                });
-            }
-        }
-        _ => {
-            let mut stream = UnixStream::connect(SOCKET_PATH).expect("[socket] bad connect(path)");
-            stream
-                .write_all(format!("{}#{}", normalized_args.0, normalized_args.1).as_bytes())
-                .expect("[message] bad send");
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-
-            let mut response = String::new();
-            stream
-                .read_to_string(&mut response)
-                .expect("[reponse] bad read");
-            println!("{}", response);
-        }
+        ("daemon", "start") => daemon(),
+        _ => client(normalized_args),
     }
 }
