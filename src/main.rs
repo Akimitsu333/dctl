@@ -61,7 +61,6 @@ impl Iterator for ConfigReader {
 
 struct ServiceStack {
     stack: HashMap<String, ArcService>,
-    // fpath: String,
 }
 
 impl Display for ServiceStack {
@@ -126,7 +125,6 @@ impl ServiceStack {
     }
 }
 
-struct ArcService(Arc<Service>);
 struct Service {
     command: String,
     args: Vec<String>,
@@ -147,6 +145,7 @@ impl Service {
     }
 }
 
+struct ArcService(Arc<Service>);
 impl Display for ArcService {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let flag = self.0.flag.load(Ordering::Relaxed).to_string();
@@ -196,16 +195,16 @@ impl ArcService {
 
                 if !result && flag && time_result {
                     continue;
-                } else {
-                    error!(
-                        "command: terminate: {} {}",
-                        &service.command,
-                        service.args.join(" ")
-                    );
-                    *service.guardian.lock().unwrap() = None;
-                    service.flag.store(false, Ordering::Release);
-                    break;
                 }
+
+                info!(
+                    "command: terminate: {} {}",
+                    &service.command,
+                    service.args.join(" ")
+                );
+                *service.guardian.lock().unwrap() = None;
+                service.flag.store(false, Ordering::Release);
+                break;
             }));
         }
 
