@@ -128,7 +128,7 @@ impl ServiceStack {
 struct Service {
     command: String,
     args: Vec<String>,
-    flag: AtomicBool,
+    allow_run: AtomicBool,
     pid: AtomicU32,
     guardian: Mutex<Option<JoinHandle<()>>>,
 }
@@ -138,7 +138,7 @@ impl Service {
         Self {
             command,
             args,
-            flag: AtomicBool::new(true),
+            allow_run: AtomicBool::new(true),
             pid: AtomicU32::new(0),
             guardian: Mutex::new(None),
         }
@@ -148,9 +148,9 @@ impl Service {
 struct ArcService(Arc<Service>);
 impl Display for ArcService {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let flag = self.0.flag.load(Ordering::Relaxed).to_string();
+        let allow_run = self.0.allow_run.load(Ordering::Relaxed).to_string();
         let pid = self.0.pid.load(Ordering::Relaxed).to_string();
-        write!(f, "[{}] {}", flag, pid)
+        write!(f, "[{}] {}", allow_run, pid)
     }
 }
 
@@ -163,7 +163,7 @@ impl ArcService {
         let mut guardian = self.0.guardian.lock().unwrap();
 
         if guardian.is_none() {
-            self.0.flag.store(true, Ordering::Relaxed);
+            self.0.allow_run.store(true, Ordering::Relaxed);
 
             let service = Arc::clone(&self.0);
 
@@ -177,7 +177,7 @@ impl ArcService {
                             service.args.join(" ")
                         );
                         *service.guardian.lock().unwrap() = None;
-                        service.flag.store(false, Ordering::Release);
+                        service.allow_run.store(false, Ordering::Release);
                         break;
                     }
                 };
@@ -186,14 +186,14 @@ impl ArcService {
 
                 let start_time = Instant::now();
 
-                let result = command.wait().unwrap().success();
+                let success_exit = command.wait().unwrap().success();
 
                 service.pid.store(0, Ordering::Release);
 
-                let time_result = start_time.elapsed() > Duration::from_secs(RESTART_SEC);
-                let flag = service.flag.load(Ordering::Acquire);
+                let allow_restart = start_time.elapsed() > Duration::from_secs(RESTART_SEC);
+                let allow_run = service.allow_run.load(Ordering::Acquire);
 
-                if !result && flag && time_result {
+                if !success_exit && allow_run && allow_restart {
                     continue;
                 }
 
@@ -203,7 +203,7 @@ impl ArcService {
                     service.args.join(" ")
                 );
                 *service.guardian.lock().unwrap() = None;
-                service.flag.store(false, Ordering::Release);
+                service.allow_run.store(false, Ordering::Release);
                 break;
             }));
         }
@@ -215,7 +215,7 @@ impl ArcService {
         let guardian = self.0.guardian.lock().unwrap();
 
         if guardian.is_some() {
-            self.0.flag.store(false, Ordering::Relaxed);
+            self.0.allow_run.store(false, Ordering::Relaxed);
 
             kill_(self.0.pid.load(Ordering::Relaxed), 15);
 
