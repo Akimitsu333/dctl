@@ -1,345 +1,319 @@
-use log::{error, info, LevelFilter};
-use std::collections::HashMap;
-use std::fmt::{self, Display};
-use std::fs::File;
-use std::io::{prelude::*, BufReader, Lines};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Arc,
+    },
+    thread,
+};
 
-mod config;
-mod libc;
-mod logger;
+const BASEPATH: &str = "/data/daemon";
+const SOCKPATH: &str = "/data/daemon/sock";
+const AUTOSPATH: &str = "/data/daemon/auto";
 
-use config::*;
-use libc::kill_;
-use logger::SimpleLogger;
+extern "C" {
+    fn kill(pid: u32, signal: u32) -> i32;
+}
 
-struct ConfigReader(Lines<BufReader<File>>);
-
-impl ConfigReader {
-    fn new(fpath: &str) -> Self {
-        Self(BufReader::new(File::open(fpath).expect("bad open file")).lines())
+fn kill_(pid: u32) -> Result<()> {
+    let result = unsafe { kill(pid, 15) };
+    match result {
+        0 => Ok(()),
+        _ => Err(Error::Internal("Bad kill -15 service")),
     }
 }
 
-impl Iterator for ConfigReader {
-    type Item = (String, String, Vec<String>);
+#[derive(Debug)]
+enum Error {
+    Dyn(String),
+    Internal(&'static str),
+    Exit,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        for line in &mut self.0 {
-            let line = line.expect("service: bad load service(of config file)");
-            let parts: Vec<&str> = line.splitn(3, ' ').collect();
-            let mut args = Vec::new();
-            match parts.len() {
-                0 | 1 => continue,
-                2 => (),
-                _ => {
-                    args.extend(
-                        parts[2]
-                            .split_whitespace()
-                            .map(|arg| arg.to_string())
-                            .collect::<Vec<String>>(),
-                    );
-                }
-            };
+impl std::error::Error for Error {}
 
-            let name = parts[0];
-            let command = parts[1];
-
-            info!("service: {}: {} {}", name, command, args.join(" "));
-
-            return Some((name.to_string(), command.to_string(), args));
-        }
-
-        None
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Dyn(value.to_string())
     }
 }
 
-struct ServiceStack {
-    stack: HashMap<String, ArcService>,
-}
-
-impl Display for ServiceStack {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut status_queue: Vec<String> = Vec::new();
-        for (k, v) in &self.stack {
-            status_queue.push(format!("{} {}", v, k));
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dyn(e) => write!(f, "{}", e),
+            Self::Internal(e) => write!(f, "{}", e),
+            Self::Exit => write!(f, "Exit"),
         }
-        write!(f, "{}", status_queue.join("\n"))
     }
 }
 
-impl ServiceStack {
-    fn new(stack: HashMap<String, ArcService>) -> Self {
-        Self { stack }
-    }
+type Result<T> = std::result::Result<T, Error>;
 
-    fn init(fpath: &str) -> Self {
-        let config_hashmap: HashMap<String, ArcService> = ConfigReader::new(fpath)
-            .map(|(name, command, args)| (name, ArcService::new(command, args)))
-            .collect();
-
-        ServiceStack::new(config_hashmap)
-    }
-
-    fn start(&self, name: &str) -> String {
-        match self.stack.get(name) {
-            Some(service) => service.start().to_string(),
-            None => String::from("service: can't find {name}"),
-        }
-    }
-
-    fn stop(&self, name: &str) -> String {
-        match self.stack.get(name) {
-            Some(service) => service.stop().to_string(),
-            None => String::from("service: can't find {name}"),
-        }
-    }
-
-    fn restart(&self, name: &str) -> String {
-        match self.stack.get(name) {
-            Some(service) => service.stop().start().to_string(),
-            None => String::from("service: can't find {name}"),
-        }
-    }
-
-    fn status(&self, name: &str) -> String {
-        match self.stack.get(name) {
-            Some(service) => service.to_string(),
-            None => String::from("service: can't find {name}"),
-        }
-    }
-
-    fn start_all(&self) -> String {
-        let _: Vec<&ArcService> = self.stack.values().map(|s| s.start()).collect();
-        self.to_string()
-    }
-
-    fn stop_all(&self) -> String {
-        let _: Vec<&ArcService> = self.stack.values().map(|s| s.stop()).collect();
-        self.to_string()
-    }
-}
-
-struct Service {
-    command: String,
-    args: Vec<String>,
-    allow_run: AtomicBool,
+#[derive(Debug)]
+struct Status {
     pid: AtomicU32,
-    guardian: Mutex<Option<JoinHandle<()>>>,
+    exit: AtomicBool,
 }
 
-impl Service {
-    fn new(command: String, args: Vec<String>) -> Self {
+impl Status {
+    fn new() -> Self {
         Self {
-            command,
-            args,
-            allow_run: AtomicBool::new(true),
-            pid: AtomicU32::new(0),
-            guardian: Mutex::new(None),
+            pid: AtomicU32::default(),
+            exit: AtomicBool::default(),
         }
     }
 }
 
-struct ArcService(Arc<Service>);
-impl Display for ArcService {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let allow_run = self.0.allow_run.load(Ordering::Relaxed).to_string();
-        let pid = self.0.pid.load(Ordering::Relaxed).to_string();
-        write!(f, "[{}] {}", allow_run, pid)
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid = self.pid.load(std::sync::atomic::Ordering::Acquire);
+        let exit = match self.exit.load(std::sync::atomic::Ordering::Acquire) {
+            false => "*",
+            true => "",
+        };
+        write!(f, "{} [{}]", pid, exit)
     }
 }
 
-impl ArcService {
-    fn new(command: String, args: Vec<String>) -> Self {
-        Self(Arc::new(Service::new(command, args)))
+fn load(name: &str) -> Result<Vec<String>> {
+    let path = format!("{}/{name}/default.service", BASEPATH);
+    let service_file = File::open(path)?;
+
+    let reader = BufReader::new(service_file);
+    let mut command = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            break;
+        }
+
+        command.push(line.to_string())
     }
 
-    fn start(&self) -> &Self {
-        let mut guardian = self.0.guardian.lock().unwrap();
+    Ok(command)
+}
 
-        if guardian.is_none() {
-            self.0.allow_run.store(true, Ordering::Relaxed);
+fn stop(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
+    name: &str,
+) -> Result<()> {
+    let status = service_stack
+        .remove(name)
+        .ok_or(Error::Internal("Bad find service"))?;
+    let pid = status.pid.load(std::sync::atomic::Ordering::Acquire);
 
-            let service = Arc::clone(&self.0);
+    if pid != 0 {
+        status
+            .exit
+            .store(true, std::sync::atomic::Ordering::Release);
+        kill_(pid)?;
 
-            *guardian = Some(thread::spawn(move || loop {
-                let mut command = match Command::new(&service.command).args(&service.args).spawn() {
-                    Ok(command) => command,
-                    Err(_) => {
-                        error!(
-                            "command: bad start: {} {}",
-                            &service.command,
-                            service.args.join(" ")
-                        );
-                        *service.guardian.lock().unwrap() = None;
-                        service.allow_run.store(false, Ordering::Release);
-                        break;
-                    }
-                };
+        handle_stack
+            .remove(name)
+            .ok_or(Error::Internal("Bad find service_handle"))?
+            .join()
+            .unwrap_or(Err(Error::Internal("Bad wait thread to stop")))?;
+    }
 
-                service.pid.store(command.id(), Ordering::Release);
+    Ok(())
+}
 
-                let start_time = Instant::now();
+fn start(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
+    name: &str,
+) -> Result<()> {
+    let name = name.to_string();
+    let name_c = name.clone();
+    let status = Arc::new(Status::new());
+    let status_c = status.clone();
 
-                let success_exit = command.wait().unwrap().success();
+    if service_stack.contains_key(&name) {
+        stop(service_stack, handle_stack, &name)?;
+    }
 
-                service.pid.store(0, Ordering::Release);
+    service_stack.insert(name.clone(), status);
 
-                let allow_restart = start_time.elapsed() > Duration::from_secs(RESTART_SEC);
-                let allow_run = service.allow_run.load(Ordering::Acquire);
+    let handle = thread::spawn(|| -> Result<()> {
+        let name = name_c;
+        let mut service = load(&name)?;
+        let name = service.remove(0);
+        let status = status_c;
 
-                if !success_exit && allow_run && allow_restart {
-                    continue;
-                }
+        loop {
+            let mut handle = Command::new(&name).args(&service).env_clear().spawn()?;
 
-                info!(
-                    "command: terminate: {} {}",
-                    &service.command,
-                    service.args.join(" ")
-                );
-                *service.guardian.lock().unwrap() = None;
-                service.allow_run.store(false, Ordering::Release);
+            status
+                .pid
+                .store(handle.id(), std::sync::atomic::Ordering::Release);
+
+            if handle.wait()?.success() {
+                status.pid.store(0, std::sync::atomic::Ordering::Release);
+                status
+                    .exit
+                    .store(true, std::sync::atomic::Ordering::Release);
                 break;
-            }));
-        }
-
-        self
-    }
-
-    fn stop(&self) -> &Self {
-        let guardian = self.0.guardian.lock().unwrap();
-
-        if guardian.is_some() {
-            self.0.allow_run.store(false, Ordering::Relaxed);
-
-            kill_(self.0.pid.load(Ordering::Relaxed), 15);
-
-            self.0.pid.store(0, Ordering::Release);
-        }
-
-        self
-    }
-}
-
-fn daemon() {
-    let _ = SimpleLogger::init(LevelFilter::Info, LOG_PATH);
-
-    info!("daemon: start running");
-
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    let listener = UnixListener::bind(SOCKET_PATH).expect("socket: bad bind(path)");
-
-    info!("service: start loading");
-
-    let stack = Arc::new(ServiceStack::init(CONFIG_PATH));
-
-    let _ = stack.start_all();
-
-    info!("service: start running");
-
-    for stream in listener.incoming() {
-        let mut stream = stream.expect("socket: bad accept socket");
-
-        let stack = Arc::clone(&stack);
-
-        thread::spawn(move || {
-            let mut message = String::new();
-            stream
-                .read_to_string(&mut message)
-                .expect("message: bad read");
-            let message: Vec<&str> = message.split('#').collect();
-
-            match (message[0], message[1]) {
-                ("daemon", "stop") => {
-                    stream
-                        .write_all(stack.stop_all().as_bytes())
-                        .expect("message: bad send");
-
-                    info!("daemon: daemon is ready to exit");
-
-                    std::process::exit(0);
-                }
-                ("daemon", "status") => {
-                    stream
-                        .write_all(stack.to_string().as_bytes())
-                        .expect("message: bad send");
-                }
-                ("status", name) => {
-                    stream
-                        .write_all(stack.status(name).as_bytes())
-                        .expect("message: bad send");
-                }
-                ("start", name) => {
-                    info!("service: start: {name}");
-
-                    stream
-                        .write_all(format!("{} {name}", stack.start(name)).as_bytes())
-                        .expect("message: bad send");
-                }
-                ("stop", name) => {
-                    info!("service: stop: {name}");
-
-                    stream
-                        .write_all(format!("{} {name}", stack.stop(name)).as_bytes())
-                        .expect("message: bad send");
-                }
-                ("restart", name) => {
-                    info!("service: restart: {name}");
-
-                    stream
-                        .write_all(format!("{} {name}", stack.restart(name)).as_bytes())
-                        .expect("message: bad send");
-                }
-                _ => {
-                    error!("option: invalid parameter");
-                    stream
-                        .write_all("option: invalid parameter".as_bytes())
-                        .expect("message: bad send");
-                }
             }
 
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
-        });
+            if status.exit.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+        }
+
+        Ok(())
+    });
+
+    handle_stack.insert(name, handle);
+
+    Ok(())
+}
+
+fn status(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    name: &str,
+    mut stream: UnixStream,
+) -> Result<()> {
+    let status = service_stack
+        .get(name)
+        .ok_or(Error::Internal("Bad find service"))?;
+    let message = format!("{name} {status}");
+    stream.write_all(message.as_bytes())?;
+
+    Ok(())
+}
+
+fn status_all(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    mut stream: UnixStream,
+) -> Result<()> {
+    let status = service_stack
+        .iter()
+        .map(|(name, status)| format!("{name} {status}"))
+        .collect::<Vec<String>>();
+    let message = status.join("\n");
+    stream.write_all(message.as_bytes())?;
+
+    Ok(())
+}
+
+fn stop_all(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let services = service_stack.keys().cloned().collect::<Vec<String>>();
+    for name in services {
+        if let Err(e) = stop(service_stack, handle_stack, &name) {
+            eprintln!("{}", e);
+        }
+    }
+
+    Err(Error::Exit)
+}
+
+fn auto_start(
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let mut services = File::open(AUTOSPATH)?;
+    let mut buffer = String::new();
+
+    services.read_to_string(&mut buffer)?;
+    let services = buffer.split_whitespace().collect::<Vec<&str>>();
+
+    for name in services {
+        start(service_stack, handle_stack, name)?;
+    }
+
+    Ok(())
+}
+
+fn daemon_exec(
+    mut stream: UnixStream,
+    buffer: &mut String,
+    service_stack: &mut HashMap<String, Arc<Status>>,
+    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    buffer.clear();
+    stream.read_to_string(buffer)?;
+    let signal = buffer
+        .split_once('/')
+        .ok_or(Error::Internal("Bad parse signal"))?;
+
+    match signal {
+        ("daemon", "stop") => stop_all(service_stack, handle_stack),
+        ("daemon", "status") => status_all(service_stack, stream),
+        ("status", name) => status(service_stack, name, stream),
+        ("start", name) => start(service_stack, handle_stack, name),
+        ("stop", name) => stop(service_stack, handle_stack, name),
+        _ => stream
+            .write_all("Invalid parameter".as_bytes())
+            .or(Err(Error::Internal("Bad parameter"))),
     }
 }
 
-fn client(args: (&str, &str)) {
-    let mut stream = UnixStream::connect(SOCKET_PATH).expect("socket: bad connect(path)");
-    stream
-        .write_all(format!("{}#{}", args.0, args.1).as_bytes())
-        .expect("message: bad send");
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
+fn daemon() -> Result<()> {
+    let _ = std::fs::remove_file(SOCKPATH);
+    let listener = UnixListener::bind(SOCKPATH)?;
+    let mut buffer = String::with_capacity(1024);
+    let mut service_stack = HashMap::new();
+    let mut handle_stack = HashMap::new();
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("reponse: bad read");
-    println!("{}", response);
+    auto_start(&mut service_stack, &mut handle_stack)?;
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("{}", e);
+                continue;
+            }
+        };
+
+        let result = daemon_exec(stream, &mut buffer, &mut service_stack, &mut handle_stack);
+
+        match result {
+            Err(Error::Exit) => break,
+            Err(e) => eprintln!("{}", e),
+            _ => (),
+        };
+    }
+
+    Ok(())
 }
 
-fn main() {
+fn client(arg_1: &str, arg_2: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(SOCKPATH)?;
+    stream.write_all(format!("{arg_1}/{arg_2}").as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    println!("{}", response);
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
     /*
         解析命令参数
     */
     let args: Vec<String> = std::env::args().collect();
 
-    let normalized_args = match args.len() {
-        1 => ("daemon", "start"),
-        2 => ("daemon", args[1].as_str()),
+    let (arg_1, arg_2) = match args.len() {
         3 => (args[1].as_str(), args[2].as_str()),
-        _ => {
-            eprintln!("option: bad command format");
-            std::process::exit(-1);
-        }
+        2 => ("daemon", args[1].as_str()),
+        1 => return daemon(),
+        _ => return Err(Error::Internal("Invalid format")),
     };
 
-    match normalized_args {
-        ("daemon", "start") => daemon(),
-        _ => client(normalized_args),
-    }
+    client(arg_1, arg_2)
 }
