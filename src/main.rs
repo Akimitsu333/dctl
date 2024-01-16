@@ -100,11 +100,7 @@ fn load(name: &str) -> Result<Vec<String>> {
     Ok(command)
 }
 
-fn stop(
-    service_stack: &mut HashMap<String, Arc<Status>>,
-    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
-    name: &str,
-) -> Result<()> {
+fn stop(service_stack: &mut HashMap<String, Arc<Status>>, name: &str) -> Result<()> {
     let status = service_stack
         .remove(name)
         .ok_or(Error::Internal("Bad find service"))?;
@@ -115,34 +111,24 @@ fn stop(
             .exit
             .store(true, std::sync::atomic::Ordering::Release);
         kill_(pid)?;
-
-        handle_stack
-            .remove(name)
-            .ok_or(Error::Internal("Bad find service_handle"))?
-            .join()
-            .unwrap_or(Err(Error::Internal("Bad wait thread to stop")))?;
     }
 
     Ok(())
 }
 
-fn start(
-    service_stack: &mut HashMap<String, Arc<Status>>,
-    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
-    name: &str,
-) -> Result<()> {
+fn start(service_stack: &mut HashMap<String, Arc<Status>>, name: &str) -> Result<()> {
     let name = name.to_string();
     let name_c = name.clone();
     let status = Arc::new(Status::new());
     let status_c = status.clone();
 
     if service_stack.contains_key(&name) {
-        stop(service_stack, handle_stack, &name)?;
+        stop(service_stack, &name)?;
     }
 
     service_stack.insert(name.clone(), status);
 
-    let handle = thread::spawn(|| -> Result<()> {
+    let _ = thread::spawn(|| -> Result<()> {
         let name = name_c;
         let mut service = load(&name)?;
         let name = service.remove(0);
@@ -170,8 +156,6 @@ fn start(
 
         Ok(())
     });
-
-    handle_stack.insert(name, handle);
 
     Ok(())
 }
@@ -204,24 +188,7 @@ fn status_all(
     Ok(())
 }
 
-fn stop_all(
-    service_stack: &mut HashMap<String, Arc<Status>>,
-    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
-) -> Result<()> {
-    let services = service_stack.keys().cloned().collect::<Vec<String>>();
-    for name in services {
-        if let Err(e) = stop(service_stack, handle_stack, &name) {
-            eprintln!("{}", e);
-        }
-    }
-
-    Err(Error::Exit)
-}
-
-fn auto_start(
-    service_stack: &mut HashMap<String, Arc<Status>>,
-    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
-) -> Result<()> {
+fn auto_start(service_stack: &mut HashMap<String, Arc<Status>>) -> Result<()> {
     let mut services = File::open(AUTOSPATH)?;
     let mut buffer = String::new();
 
@@ -229,7 +196,7 @@ fn auto_start(
     let services = buffer.split_whitespace().collect::<Vec<&str>>();
 
     for name in services {
-        start(service_stack, handle_stack, name)?;
+        start(service_stack, name)?;
     }
 
     Ok(())
@@ -239,7 +206,6 @@ fn daemon_exec(
     mut stream: UnixStream,
     buffer: &mut String,
     service_stack: &mut HashMap<String, Arc<Status>>,
-    handle_stack: &mut HashMap<String, thread::JoinHandle<Result<()>>>,
 ) -> Result<()> {
     buffer.clear();
     stream.read_to_string(buffer)?;
@@ -248,11 +214,11 @@ fn daemon_exec(
         .ok_or(Error::Internal("Bad parse signal"))?;
 
     match signal {
-        ("daemon", "stop") => stop_all(service_stack, handle_stack),
+        ("daemon", "stop") => Err(Error::Exit),
         ("daemon", "status") => status_all(service_stack, stream),
         ("status", name) => status(service_stack, name, stream),
-        ("start", name) => start(service_stack, handle_stack, name),
-        ("stop", name) => stop(service_stack, handle_stack, name),
+        ("start", name) => start(service_stack, name),
+        ("stop", name) => stop(service_stack, name),
         _ => stream
             .write_all("Invalid parameter".as_bytes())
             .or(Err(Error::Internal("Bad parameter"))),
@@ -264,9 +230,8 @@ fn daemon() -> Result<()> {
     let listener = UnixListener::bind(SOCKPATH)?;
     let mut buffer = String::with_capacity(1024);
     let mut service_stack = HashMap::new();
-    let mut handle_stack = HashMap::new();
 
-    auto_start(&mut service_stack, &mut handle_stack)?;
+    auto_start(&mut service_stack)?;
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -277,7 +242,7 @@ fn daemon() -> Result<()> {
             }
         };
 
-        let result = daemon_exec(stream, &mut buffer, &mut service_stack, &mut handle_stack);
+        let result = daemon_exec(stream, &mut buffer, &mut service_stack);
 
         match result {
             Err(Error::Exit) => break,
